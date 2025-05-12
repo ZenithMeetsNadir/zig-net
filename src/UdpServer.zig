@@ -23,6 +23,7 @@ serve_th: Thread = undefined,
 
 pub fn getNonBlockingDGram() (posix.FcntlError || posix.SocketError)!socket_t {
     const socket: socket_t = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    errdefer posix.close(socket);
 
     switch (builtin.os.tag) {
         .windows => {
@@ -46,6 +47,8 @@ pub fn getNonBlockingDGram() (posix.FcntlError || posix.SocketError)!socket_t {
 
 pub fn open(ip: []const u8, port: u16) (posix.SocketError || posix.FcntlError || net.IPv4ParseError || posix.BindError)!UdpServer {
     const socket: socket_t = try getNonBlockingDGram();
+    errdefer posix.close(socket);
+
     const ip4 = try Ip4Address.parse(ip, port);
 
     try posix.bind(socket, @ptrCast(&ip4.sa), @sizeOf(in));
