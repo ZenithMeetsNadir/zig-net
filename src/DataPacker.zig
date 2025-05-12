@@ -53,9 +53,8 @@ pub fn valueOfContinue(self: DataPacker, iter: *std.mem.SplitIterator(u8, .scala
         return null;
 
     return while (iter.next()) |pair| {
-        if (pair.len > key.len and std.mem.startsWith(u8, pair, key) and pair[key.len] == self.key_value_delim) {
+        if (pair.len > key.len and std.mem.startsWith(u8, pair, key) and pair[key.len] == self.key_value_delim)
             break pair[key.len + 1 ..];
-        }
     } else null;
 }
 
