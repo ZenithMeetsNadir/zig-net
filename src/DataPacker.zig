@@ -27,9 +27,8 @@ pub fn keyValueMode(self: *DataPacker, key_value_delim: ?u8) void {
         self.key_value_delim = kvd;
 }
 
-// DISCLAIMER:
-// the following encryption and decryption is merely a xor obfuscation and guarantees less than no security
-
+/// DISCLAIMER:
+/// the following encryption and decryption is merely a xor obfuscation and guarantees less than no security
 pub fn whichevercrypt(self: DataPacker, data: []const u8, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
     const encrypted = try allocator.alloc(u8, data.len);
 
