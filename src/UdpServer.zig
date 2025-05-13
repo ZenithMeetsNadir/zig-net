@@ -13,7 +13,7 @@ const UdpServer = @This();
 
 const AtomicBool = std.atomic.Value(bool);
 
-pub const buffer_size = 1048;
+pub const buffer_size = 1024;
 
 socket: socket_t,
 ip4: net.Ip4Address,
