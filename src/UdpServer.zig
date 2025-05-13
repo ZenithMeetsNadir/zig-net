@@ -13,7 +13,7 @@ const UdpServer = @This();
 
 const AtomicBool = std.atomic.Value(bool);
 
-pub const buffer_size = 1024;
+pub const buffer_size = 1048;
 
 socket: socket_t,
 ip4: net.Ip4Address,
@@ -96,7 +96,10 @@ fn listenLoop(self: *UdpServer) void {
         var sender_addr: in = undefined;
         var addr_len: posix.socklen_t = @sizeOf(in);
 
-        const data_len = posix.recvfrom(self.socket, &buffer, 0, @ptrCast(&sender_addr), &addr_len) catch continue;
+        const data_len = posix.recvfrom(self.socket, &buffer, 0, @ptrCast(&sender_addr), &addr_len) catch |err| switch (err) {
+            posix.RecvFromError.MessageTooBig => buffer_size,
+            else => continue,
+        };
         if (data_len == 0) continue;
 
         const ip4 = Ip4Address{
