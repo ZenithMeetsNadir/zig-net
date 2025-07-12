@@ -32,7 +32,7 @@ pub const Connection = struct {
         }
     }
 
-    pub fn send(self: Connection, data: []const u8) posix.SendError!void {
+    pub fn send(self: Connection, data: []const u8) posix.WriteError!void {
         const bytes_sent = posix.write(self.socket, data) catch |err| switch (err) {
             posix.WriteError.WouldBlock => return,
             else => return err,

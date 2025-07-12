@@ -18,7 +18,7 @@ pub const buffer_size = 1024;
 
 socket: socket_t,
 ip4: net.Ip4Address,
-dispatch_fn: ?*const fn (self: *const UdpServer, sender_addr: Ip4Address, data: []const u8) anyerror!void = null,
+dispatch_fn: ?*const fn (server: *const UdpServer, sender_addr: Ip4Address, data: []const u8) anyerror!void = null,
 running: AtomicBool = .init(false),
 serve_th: Thread = undefined,
 
