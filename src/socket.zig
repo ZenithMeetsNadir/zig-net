@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const socket_t = posix.socket_t;
 const windows = std.os.windows;
+const fcntl = @import("root.zig").fnctl;
 
 pub fn setNonBlocking(socket: socket_t) (posix.FcntlError || posix.SocketError)!void {
     switch (builtin.os.tag) {
@@ -14,9 +15,8 @@ pub fn setNonBlocking(socket: socket_t) (posix.FcntlError || posix.SocketError)!
                 return posix.SocketError.Unexpected;
         },
         else => {
-            // wouldn't work for some reason when cross-compiling for linux
-            // const O_NONBLOCK = posix.O.NONBLOCK;
-            const O_NONBLOCK = 0o400;
+            const O_NONBLOCK = fcntl.O_NONBLOCK;
+            //const O_NONBLOCK = 0o400;
             const flags = try posix.fcntl(socket, posix.F.GETFL, 0);
             _ = try posix.fcntl(socket, posix.F.SETFL, flags | O_NONBLOCK);
         },
