@@ -9,79 +9,136 @@ const Ip4Address = net.Ip4Address;
 const Thread = std.Thread;
 const windows = std.os.windows;
 const socket_util = @import("../socket.zig");
+const tcp = @import("tcp.zig");
 
 const TcpServer = @This();
 
 const AtomicBool = std.atomic.Value(bool);
 
+const OpenError = tcp.OpenError || posix.BindError || posix.SetSockOptError;
+const ListenError = tcp.ListenError || posix.ListenError || error{NotBound};
+const AcceptLoopError = std.mem.Allocator.Error || posix.AcceptError || Connection.ConnListenError;
+
 pub const Connection = struct {
+    pub const ConnListenError = tcp.ListenError || error{ NotAlive, AlreadyListening };
+    pub const ConnAcceptError = posix.AcceptError;
+
     socket: socket_t,
     client_ip4: Ip4Address,
-    running: AtomicBool = .init(false),
+    alive: bool,
+    listening: AtomicBool = .init(false),
     awaits_disposal: AtomicBool = .init(false),
-    thread: Thread = undefined,
+    listen_th: ?Thread = null,
+    server: *TcpServer,
+
+    pub fn accept(bound_socket: socket_t, server: *TcpServer) ConnAcceptError!Connection {
+        var client_ip4: Ip4Address = undefined;
+        var sock_len: posix.socklen_t = @sizeOf(@TypeOf(client_ip4.sa));
+        const flags: u32 = if (!server.blocking) posix.SOCK.NONBLOCK else 0;
+
+        const socket = try posix.accept(bound_socket, @ptrCast(&client_ip4.sa), &sock_len, flags);
+
+        return Connection{
+            .socket = socket,
+            .client_ip4 = client_ip4,
+            .alive = true,
+            .server = server,
+        };
+    }
 
     pub fn close(self: *Connection) void {
-        if (self.running.load(.acquire)) {
-            self.running.store(false, .release);
+        if (self.listen_th) |th| {
+            self.listening.store(false, .release);
 
-            self.thread.join();
+            if (self.server.blocking) {
+                self.alive = false;
+                posix.shutdown(self.socket, posix.ShutdownHow.both) catch |err| {
+                    std.log.err("tcp server connection socket shutdown error: {s}", .{@errorName(err)});
+                    std.log.info("tcp server connection closing socket", .{});
+                    posix.close(self.socket);
+                };
+            }
 
+            th.join();
+            self.listen_th = null;
+        }
+
+        if (self.alive) {
+            self.alive = false;
             posix.close(self.socket);
-            std.log.info("tcp connection from {} closed", .{self.client_ip4});
         }
+
+        std.log.info("tcp connection from {f} closed", .{self.client_ip4});
     }
 
-    pub fn send(self: Connection, data: []const u8) posix.WriteError!void {
-        const bytes_sent = posix.write(self.socket, data) catch |err| switch (err) {
-            posix.WriteError.WouldBlock => return,
-            else => return err,
-        };
-        std.debug.assert(bytes_sent == data.len);
+    pub fn listen(self: *Connection) ConnListenError!void {
+        if (!self.alive)
+            return ConnListenError.NotAlive;
+
+        if (self.listen_th != null)
+            return ConnListenError.AlreadyListening;
+
+        self.listening.store(true, .release);
+        errdefer self.listening.store(false, .release);
+
+        self.listen_th = try Thread.spawn(.{}, listenLoop, .{self});
+
+        std.log.info("tcp connection to {f} opened", .{self.client_ip4});
     }
 
-    pub fn listen(self: *Connection, server: *TcpServer) Thread.SpawnError!void {
-        if (!self.running.load(.acquire)) {
-            self.running.store(true, .release);
+    fn listenLoop(self: *Connection) void {
+        if (self.server.dispatch_fn == null)
+            return;
 
-            self.thread = try Thread.spawn(.{}, dispatchLoop, .{ self, server });
+        var buffer: [tcp.buffer_size]u8 = undefined;
 
-            std.log.info("tcp connection to {} opened", .{self.client_ip4});
-        }
-    }
-
-    fn dispatchLoop(self: *Connection, server: *TcpServer) void {
-        var buffer: [buffer_size]u8 = undefined;
-
-        while (self.running.load(.acquire) and server.running.load(.acquire) and server.dispatch_fn != null) {
+        while (self.listening.load(.acquire) and self.server.listening.load(.acquire)) {
             const data_len = posix.recv(self.socket, &buffer, 0) catch |err| switch (err) {
-                posix.RecvFromError.MessageTooBig => buffer_size,
+                posix.RecvFromError.MessageTooBig => tcp.buffer_size,
                 else => continue,
             };
             if (data_len == 0) continue;
 
-            server.dispatch_fn.?(server, self, buffer[0..data_len]) catch continue;
+            self.server.dispatch_fn.?(self, buffer[0..data_len]) catch continue;
         }
+    }
+
+    pub fn send(self: Connection, data: []const u8) tcp.SendError!void {
+        const bytes_sent = posix.write(self.socket, data) catch |err| switch (err) {
+            posix.WriteError.WouldBlock => if (self.server.blocking) return err else return,
+            else => return err,
+        };
+
+        if (bytes_sent != data.len)
+            std.log.err("tcp server send failed - number of bytes sent: {d} of {d}", .{ bytes_sent, data.len });
+    }
+
+    pub inline fn markForDisposal(self: *Connection) void {
+        self.awaits_disposal.store(true, .release);
     }
 };
 
-pub const buffer_size = 1024;
 const backlog = 128;
 
 socket: socket_t,
-ip4: net.Ip4Address,
-dispatch_fn: ?*const fn (server: *TcpServer, connection: *Connection, data: []const u8) anyerror!void = null,
-running: AtomicBool = .init(false),
-serve_th: Thread = undefined,
+ip4: Ip4Address,
+blocking: bool,
+bound: bool,
+/// this callback should be written with care, as it will be called from multiple listening connection threads
+dispatch_fn: ?*const fn (connection: *Connection, data: []const u8) anyerror!void = null,
+listening: AtomicBool = .init(false),
+listen_th: ?Thread = null,
 allocator: std.mem.Allocator,
-connections: std.ArrayList(*Connection),
+connections: std.array_list.Managed(*Connection),
 conn_mutex: Thread.Mutex = .{},
 
-pub fn open(ip: []const u8, port: u16, allocator: std.mem.Allocator) (posix.SocketError || posix.FcntlError || net.IPv4ParseError || posix.BindError || posix.SetSockOptError)!TcpServer {
+pub fn open(ip: []const u8, port: u16, blocking: bool, allocator: std.mem.Allocator) OpenError!TcpServer {
     const socket: socket_t = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
     errdefer posix.close(socket);
 
-    try socket_util.setNonBlocking(socket);
+    if (!blocking)
+        try socket_util.setNonBlocking(socket);
+
     try socket_util.keepAlive(socket);
 
     const ip4 = try Ip4Address.parse(ip, port);
@@ -91,27 +148,28 @@ pub fn open(ip: []const u8, port: u16, allocator: std.mem.Allocator) (posix.Sock
     return TcpServer{
         .socket = socket,
         .ip4 = ip4,
+        .blocking = blocking,
+        .bound = true,
         .allocator = allocator,
         .connections = .init(allocator),
     };
 }
 
-pub fn listen(self: *TcpServer) (Thread.SpawnError || posix.ListenError)!void {
-    if (!self.running.load(.acquire)) {
-        self.running.store(true, .release);
-
-        try posix.listen(self.socket, backlog);
-
-        self.serve_th = try Thread.spawn(.{}, acceptLoop, .{self});
-
-        std.log.info("tcp server running on {}...", .{self.ip4});
-    }
-}
-
 pub fn close(self: *TcpServer) void {
-    if (self.running.load(.acquire)) {
-        self.running.store(false, .release);
-        self.serve_th.join();
+    if (self.listen_th) |th| {
+        self.listening.store(false, .release);
+
+        if (self.blocking) {
+            self.bound = false;
+            posix.shutdown(self.socket, posix.ShutdownHow.both) catch |err| {
+                std.log.err("tcp server socket shutdown error: {s}", .{@errorName(err)});
+                std.log.info("tcp server closing socket", .{});
+                posix.close(self.socket);
+            };
+        }
+
+        th.join();
+        self.listen_th = null;
 
         self.conn_mutex.lock();
         const len = self.connections.items.len;
@@ -120,42 +178,56 @@ pub fn close(self: *TcpServer) void {
             self.allocator.destroy(conn);
         }
         self.connections.deinit();
-        // no need to unlock on close
+        self.conn_mutex.unlock();
 
-        std.log.info("all {} tcp connections closed", .{len});
+        std.log.info("all {d} tcp connections closed", .{len});
     }
 
-    posix.close(self.socket);
+    if (self.bound) {
+        self.bound = false;
+        posix.close(self.socket);
+    }
+
     std.log.info("tcp server shut down", .{});
 }
 
+pub fn listen(self: *TcpServer) ListenError!void {
+    if (!self.bound)
+        return ListenError.NotBound;
+
+    if (self.listen_th != null)
+        return ListenError.AlreadyListening;
+
+    self.listening.store(true, .release);
+    errdefer self.listening.store(false, .release);
+
+    try posix.listen(self.socket, backlog);
+
+    self.listen_th = try Thread.spawn(.{}, acceptLoop, .{self});
+
+    std.log.info("tcp server listening on {f}...", .{self.ip4});
+}
+
 fn acceptLoop(self: *TcpServer) void {
-    while (self.running.load(.acquire)) {
-        self.acceptLoopErrorNet() catch Thread.yield() catch {};
+    while (self.listening.load(.acquire)) {
+        self.acceptLoopErrorNet() catch {};
         self.closeExpiredConnections();
     }
 }
 
-fn acceptLoopErrorNet(self: *TcpServer) !void {
-    var client_ip4: Ip4Address = undefined;
-
-    var sock_len: posix.socklen_t = @sizeOf(@TypeOf(client_ip4.sa));
-    const accepted_socket: socket_t = try posix.accept(self.socket, @ptrCast(&client_ip4.sa), &sock_len, posix.SOCK.NONBLOCK);
+fn acceptLoopErrorNet(self: *TcpServer) AcceptLoopError!void {
+    var conn = try Connection.accept(self.socket, self);
+    errdefer conn.close();
 
     // destroyed when joining the connection thread
-    var connection = self.allocator.create(Connection) catch |err| {
-        posix.close(accepted_socket);
-        return err;
-    };
-    errdefer self.allocator.destroy(connection);
-    connection.socket = accepted_socket;
-    errdefer connection.close();
-    connection.client_ip4 = client_ip4;
+    var conn_alloc = try self.allocator.create(Connection);
+    errdefer self.allocator.destroy(conn_alloc);
+    conn_alloc.* = conn;
 
-    try connection.listen(self);
+    try conn_alloc.listen();
 
     self.conn_mutex.lock();
-    try self.connections.append(connection);
+    try self.connections.append(conn_alloc);
     self.conn_mutex.unlock();
 }
 
