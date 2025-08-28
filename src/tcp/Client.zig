@@ -16,9 +16,9 @@ const TcpClient = @This();
 
 const AtomicBool = std.atomic.Value(bool);
 
-const ConnectError = tcp.OpenError || posix.ConnectError;
-const ListenError = tcp.ListenError || error{NotConnected};
-const SendError = tcp.SendError || error{NotConnected};
+pub const ConnectError = tcp.OpenError || posix.ConnectError;
+pub const ListenError = tcp.ListenError || error{NotConnected};
+pub const SendError = tcp.SendError || error{NotConnected};
 
 socket: socket_t,
 ip4: net.Ip4Address,

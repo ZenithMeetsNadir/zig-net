@@ -1,6 +1,6 @@
 .{
     .name = .net,
-    .version = "0.2.2",
+    .version = "0.2.4",
     .fingerprint = 0xf2ea15ffb14fcb60,
     .minimum_zig_version = "0.15.1",
     .dependencies = .{},
