@@ -6,4 +6,4 @@ pub const OpenError = posix.SocketError || posix.FcntlError || net.IPv4ParseErro
 pub const ListenError = std.Thread.SpawnError || error{AlreadyListening};
 pub const SendError = posix.WriteError;
 
-pub const buffer_size = 1024;
+pub const buffer_size = 0x400;

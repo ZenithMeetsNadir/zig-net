@@ -28,9 +28,10 @@ connected: bool,
 dispatch_fn: ?*const fn (self: *const TcpClient, data: []const u8) anyerror!void = null,
 listening: AtomicBool = .init(false),
 listen_th: ?Thread = null,
+buffer_size: usize,
 
 /// Creates a TCP client and connects to the specified IP and port. Uses a blocking or non-blocking socket
-pub fn connect(ip: []const u8, port: u16, blocking: bool) ConnectError!TcpClient {
+pub fn connect(ip: []const u8, port: u16, blocking: bool, buffer_size: ?usize) ConnectError!TcpClient {
     const socket: socket_t = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
     errdefer posix.close(socket);
 
@@ -49,6 +50,7 @@ pub fn connect(ip: []const u8, port: u16, blocking: bool) ConnectError!TcpClient
         .ip4 = ip4,
         .blocking = blocking,
         .connected = true,
+        .buffer_size = buffer_size orelse tcp.buffer_size,
     };
 }
 
@@ -85,7 +87,7 @@ pub fn close(self: *TcpClient) void {
 /// Returns
 /// `NotConnected` if the client is not connected
 /// `AlreadyListening` if the listen thread is already running.
-pub fn listen(self: *TcpClient) ListenError!void {
+pub fn listen(self: *TcpClient, allocator: std.mem.Allocator) ListenError!void {
     if (!self.connected)
         return ListenError.NotConnected;
 
@@ -95,21 +97,22 @@ pub fn listen(self: *TcpClient) ListenError!void {
     self.listening.store(true, .release);
     errdefer self.listening.store(false, .release);
 
-    self.listen_th = try Thread.spawn(.{}, listenLoop, .{self});
+    self.listen_th = try Thread.spawn(.{}, listenLoop, .{ self, allocator });
 
     std.log.info("tcp client running...", .{});
 }
 
-fn listenLoop(self: *const TcpClient) void {
+fn listenLoop(self: *const TcpClient, allocator: std.mem.Allocator) std.mem.Allocator.Error!void {
     if (self.dispatch_fn == null) {
         std.log.warn("tcp client dispatch function is not set", .{});
         return;
     }
 
-    var buffer: [tcp.buffer_size]u8 = undefined;
+    const buffer = try allocator.alloc(u8, self.buffer_size);
+    defer allocator.free(buffer);
 
     while (self.listening.load(.acquire)) {
-        const data_len = posix.recv(self.socket, &buffer, 0) catch |err| switch (err) {
+        const data_len = posix.recv(self.socket, buffer, 0) catch |err| switch (err) {
             posix.RecvFromError.MessageTooBig => tcp.buffer_size,
             else => continue,
         };

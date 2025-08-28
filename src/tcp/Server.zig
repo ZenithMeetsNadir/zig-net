@@ -98,16 +98,17 @@ pub const Connection = struct {
         std.log.info("tcp connection to {f} opened", .{self.client_ip4});
     }
 
-    fn listenLoop(self: *Connection) void {
+    fn listenLoop(self: *Connection) std.mem.Allocator.Error!void {
         if (self.server.dispatch_fn == null) {
             std.log.warn("tcp server dispatch function is not set", .{});
             return;
         }
 
-        var buffer: [tcp.buffer_size]u8 = undefined;
+        const buffer = try self.server.allocator.alloc(u8, self.server.buffer_size);
+        defer self.server.allocator.free(buffer);
 
         while (self.listening.load(.acquire) and self.server.listening.load(.acquire)) {
-            const data_len = posix.recv(self.socket, &buffer, 0) catch |err| switch (err) {
+            const data_len = posix.recv(self.socket, buffer, 0) catch |err| switch (err) {
                 posix.RecvFromError.MessageTooBig => tcp.buffer_size,
                 else => continue,
             };
@@ -149,11 +150,12 @@ bound: bool,
 dispatch_fn: ?*const fn (connection: *Connection, data: []const u8) anyerror!void = null,
 listening: AtomicBool = .init(false),
 listen_th: ?Thread = null,
-allocator: std.mem.Allocator,
 connections: std.array_list.Managed(*Connection),
+buffer_size: usize,
+allocator: std.mem.Allocator,
 
 /// Creates a TCP server and binds to the specified IP and port. Uses a blocking or non-blocking socket
-pub fn open(ip: []const u8, port: u16, blocking: bool, allocator: std.mem.Allocator) OpenError!TcpServer {
+pub fn open(ip: []const u8, port: u16, blocking: bool, buffer_size: ?usize, allocator: std.mem.Allocator) OpenError!TcpServer {
     const socket: socket_t = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
     errdefer posix.close(socket);
 
@@ -171,8 +173,9 @@ pub fn open(ip: []const u8, port: u16, blocking: bool, allocator: std.mem.Alloca
         .ip4 = ip4,
         .blocking = blocking,
         .bound = true,
-        .allocator = allocator,
         .connections = .init(allocator),
+        .buffer_size = buffer_size orelse tcp.buffer_size,
+        .allocator = allocator,
     };
 }
 
