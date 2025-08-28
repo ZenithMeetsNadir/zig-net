@@ -151,7 +151,6 @@ listening: AtomicBool = .init(false),
 listen_th: ?Thread = null,
 allocator: std.mem.Allocator,
 connections: std.array_list.Managed(*Connection),
-conn_mutex: Thread.Mutex = .{},
 
 /// Creates a TCP server and binds to the specified IP and port. Uses a blocking or non-blocking socket
 pub fn open(ip: []const u8, port: u16, blocking: bool, allocator: std.mem.Allocator) OpenError!TcpServer {
@@ -196,14 +195,12 @@ pub fn close(self: *TcpServer) void {
         th.join();
         self.listen_th = null;
 
-        self.conn_mutex.lock();
         const len = self.connections.items.len;
         for (self.connections.items) |conn| {
             conn.close();
             self.allocator.destroy(conn);
         }
         self.connections.deinit();
-        self.conn_mutex.unlock();
 
         std.log.info("all {d} tcp connections closed", .{len});
     }
@@ -256,14 +253,12 @@ fn acceptLoopErrorNet(self: *TcpServer) AcceptLoopError!void {
 
     try conn_alloc.listen();
 
-    self.conn_mutex.lock();
     try self.connections.append(conn_alloc);
-    self.conn_mutex.unlock();
 }
 
 fn closeExpiredConnections(self: *TcpServer) void {
     var i: usize = 0;
-    self.conn_mutex.lock();
+
     while (i < self.connections.items.len) {
         if (self.connections.items[i].awaits_disposal.load(.acquire)) {
             var exp_conn = self.connections.swapRemove(i);
@@ -271,5 +266,4 @@ fn closeExpiredConnections(self: *TcpServer) void {
             self.allocator.destroy(exp_conn);
         } else i += 1;
     }
-    self.conn_mutex.unlock();
 }
