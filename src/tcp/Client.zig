@@ -18,6 +18,7 @@ const AtomicBool = std.atomic.Value(bool);
 
 const ConnectError = tcp.OpenError || posix.ConnectError;
 const ListenError = tcp.ListenError || error{NotConnected};
+const SendError = tcp.SendError || error{NotConnected};
 
 socket: socket_t,
 ip4: net.Ip4Address,
@@ -28,6 +29,7 @@ dispatch_fn: ?*const fn (self: *const TcpClient, data: []const u8) anyerror!void
 listening: AtomicBool = .init(false),
 listen_th: ?Thread = null,
 
+/// Creates a TCP client and connects to the specified IP and port. Uses a blocking or non-blocking socket
 pub fn connect(ip: []const u8, port: u16, blocking: bool) ConnectError!TcpClient {
     const socket: socket_t = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
     errdefer posix.close(socket);
@@ -50,21 +52,9 @@ pub fn connect(ip: []const u8, port: u16, blocking: bool) ConnectError!TcpClient
     };
 }
 
-pub fn listen(self: *TcpClient) ListenError!void {
-    if (!self.connected)
-        return ListenError.NotConnected;
-
-    if (self.listen_th != null)
-        return ListenError.AlreadyListening;
-
-    self.listening.store(true, .release);
-    errdefer self.listening.store(false, .release);
-
-    self.listen_th = try Thread.spawn(.{}, listenLoop, .{self});
-
-    std.log.info("tcp client running...", .{});
-}
-
+/// closes the TCP client socket and stops the listen thread if running.
+///
+/// It is safe to call this function more than once.
 pub fn close(self: *TcpClient) void {
     if (self.listen_th) |th| {
         self.listening.store(false, .release);
@@ -90,20 +80,35 @@ pub fn close(self: *TcpClient) void {
     std.log.info("tcp client shut down", .{});
 }
 
-pub fn send(self: TcpClient, data: []const u8) tcp.SendError!void {
-    const bytes_sent = posix.write(self.socket, data) catch |err| switch (err) {
-        posix.WriteError.WouldBlock => if (self.blocking) return err else return,
-        else => return err,
-    };
+/// starts listening on a dedicated thread for incoming data.
+///
+/// Returns
+/// `NotConnected` if the client is not connected
+/// `AlreadyListening` if the listen thread is already running.
+pub fn listen(self: *TcpClient) ListenError!void {
+    if (!self.connected)
+        return ListenError.NotConnected;
 
-    if (bytes_sent != data.len)
-        std.log.err("tcp client send failed - number of bytes sent: {d} of {d}", .{ bytes_sent, data.len });
+    if (self.listen_th != null)
+        return ListenError.AlreadyListening;
+
+    self.listening.store(true, .release);
+    errdefer self.listening.store(false, .release);
+
+    self.listen_th = try Thread.spawn(.{}, listenLoop, .{self});
+
+    std.log.info("tcp client running...", .{});
 }
 
 fn listenLoop(self: *const TcpClient) void {
+    if (self.dispatch_fn == null) {
+        std.log.warn("tcp client dispatch function is not set", .{});
+        return;
+    }
+
     var buffer: [tcp.buffer_size]u8 = undefined;
 
-    while (self.listening.load(.acquire) and self.dispatch_fn != null) {
+    while (self.listening.load(.acquire)) {
         const data_len = posix.recv(self.socket, &buffer, 0) catch |err| switch (err) {
             posix.RecvFromError.MessageTooBig => tcp.buffer_size,
             else => continue,
@@ -112,4 +117,20 @@ fn listenLoop(self: *const TcpClient) void {
 
         self.dispatch_fn.?(self, buffer[0..data_len]) catch continue;
     }
+}
+
+/// sends data through client's connected socket
+///
+/// Returns `NotConnected` if the client is not connected
+pub fn send(self: TcpClient, data: []const u8) SendError!void {
+    if (!self.connected)
+        return SendError.NotConnected;
+
+    const bytes_sent = posix.write(self.socket, data) catch |err| switch (err) {
+        posix.WriteError.WouldBlock => if (self.blocking) return err else return,
+        else => return err,
+    };
+
+    if (bytes_sent != data.len)
+        std.log.err("tcp client send failed - number of bytes sent: {d} of {d}", .{ bytes_sent, data.len });
 }
