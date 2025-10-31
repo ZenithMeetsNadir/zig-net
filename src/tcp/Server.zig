@@ -8,22 +8,23 @@ const socket_t = posix.socket_t;
 const Ip4Address = net.Ip4Address;
 const Thread = std.Thread;
 const windows = std.os.windows;
-const socket_util = @import("../socket.zig");
+const util = @import("util");
+const socket_util = util.socket;
 const tcp = @import("tcp.zig");
 
 const TcpServer = @This();
 
 const AtomicBool = std.atomic.Value(bool);
 
-pub const OpenError = tcp.OpenError || posix.BindError || posix.SetSockOptError;
-pub const ListenError = tcp.ListenError || posix.ListenError || error{NotBound};
-pub const AcceptLoopError = std.mem.Allocator.Error || posix.AcceptError || Connection.ConnListenError;
+pub const ServerOpenError = tcp.OpenError || posix.BindError || posix.SetSockOptError;
+pub const ServerListenError = tcp.ListenError || posix.ListenError || error{NotBound};
+pub const ServerAcceptLoopError = std.mem.Allocator.Error || posix.AcceptError || Connection.ConnListenError;
 
-/// Represents a single TCP connection accepted by `TcpServer`
+/// represents a single TCP connection accepted by `TcpServer`
 pub const Connection = struct {
-    pub const ConnListenError = tcp.ListenError || error{ NotAlive, AlreadyListening };
+    pub const ConnListenError = tcp.ListenError || error{NotAlive};
     pub const ConnAcceptError = posix.AcceptError;
-    pub const SendError = tcp.SendError || error{NotAlive};
+    pub const ConnSendError = tcp.SendError || error{NotAlive};
 
     socket: socket_t,
     client_ip4: Ip4Address,
@@ -50,7 +51,7 @@ pub const Connection = struct {
         };
     }
 
-    /// closes the connection socket and stops the listen thread if running
+    /// Closes the connection socket and stops the listen thread if running.
     ///
     /// It is safe to call this function more than once.
     pub fn close(self: *Connection) void {
@@ -78,10 +79,10 @@ pub const Connection = struct {
         std.log.info("tcp connection from {f} closed", .{self.client_ip4});
     }
 
-    /// starts listening on a dedicated thread for incoming data.
+    /// Starts listening for incoming data on a dedicated thread. Triggers server defined callback `dispatch_fn` on receive.
     ///
-    /// Returns
-    /// `NotAlive` if the connection is not alive
+    /// Returns:
+    /// `NotAlive` if the connection is not alive.
     /// `AlreadyListening` if the listen thread is already running.
     pub fn listen(self: *Connection) ConnListenError!void {
         if (!self.alive)
@@ -99,10 +100,8 @@ pub const Connection = struct {
     }
 
     fn listenLoop(self: *Connection) std.mem.Allocator.Error!void {
-        if (self.server.dispatch_fn == null) {
-            std.log.warn("tcp server dispatch function is not set", .{});
-            return;
-        }
+        if (self.server.dispatch_fn == null)
+            std.log.warn("tcp server dispatch function is not set, incoming data will not be processed", .{});
 
         const buffer = try self.server.allocator.alloc(u8, self.server.buffer_size);
         defer self.server.allocator.free(buffer);
@@ -114,34 +113,37 @@ pub const Connection = struct {
             };
             if (data_len == 0) continue;
 
-            self.server.dispatch_fn.?(self, buffer[0..data_len]) catch continue;
+            if (self.server.dispatch_fn) |dspch| {
+                dspch(self, buffer[0..data_len]) catch continue;
+            }
         }
     }
 
-    /// sends data to the `Connection`'s connected socket
-    pub fn send(self: Connection, data: []const u8) SendError!void {
+    /// Sends data through the `Connection`'s connected socket.
+    ///
+    /// Returns `NotAlive` if the connection is not alive.
+    /// It might immediately return `WouldBlock` for a blocking operation in non-blocking mode.
+    pub fn send(self: Connection, data: []const u8) ConnSendError!void {
         if (!self.alive)
-            return SendError.NotAlive;
+            return ConnSendError.NotAlive;
 
-        const bytes_sent = posix.write(self.socket, data) catch |err| switch (err) {
-            posix.WriteError.WouldBlock => if (self.server.blocking) return err else return,
-            else => return err,
-        };
+        const bytes_sent = try posix.write(self.socket, data);
 
         if (bytes_sent != data.len)
-            std.log.err("tcp server send failed - number of bytes sent: {d} of {d}", .{ bytes_sent, data.len });
+            std.log.warn("tcp server send() inconsistency - number of bytes sent: {d} of {d}.", .{ bytes_sent, data.len });
     }
 
-    /// Marks the connection for disposal. It will be closed and removed from the server's connection list.
-    /// Useful if the connection is to be closed from within the dispatch function.
-    pub inline fn markForDisposal(self: *Connection) void {
+    /// Labels the connection to be later disposed of. It will be closed and removed from the server's connection list.
+    /// Useful when closing the connection from within the dispatch function.
+    pub inline fn labelDispose(self: *Connection) void {
         self.awaits_disposal.store(true, .release);
     }
 };
 
-/// How many incoming connections can be queued up before the kernel starts rejecting new ones.
+/// the number of incoming connections queued up before the kernel starts rejecting new ones
 const backlog = 128;
 
+// TcpServer struct
 socket: socket_t,
 ip4: Ip4Address,
 blocking: bool,
@@ -154,8 +156,10 @@ connections: std.array_list.Managed(*Connection),
 buffer_size: usize,
 allocator: std.mem.Allocator,
 
-/// Creates a TCP server and binds to the specified IP and port. Uses a blocking or non-blocking socket
-pub fn open(ip: []const u8, port: u16, blocking: bool, buffer_size: ?usize, allocator: std.mem.Allocator) OpenError!TcpServer {
+/// Creates a TCP server and binds to the specified IP and port. Uses a blocking or non-blocking socket.
+///
+/// If passed `buffer_size` is null, the default buffer size defined in `tcp.buffer_size` is used.
+pub fn open(ip: []const u8, port: u16, blocking: bool, buffer_size: ?usize, allocator: std.mem.Allocator) ServerOpenError!TcpServer {
     const socket: socket_t = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
     errdefer posix.close(socket);
 
@@ -179,7 +183,7 @@ pub fn open(ip: []const u8, port: u16, blocking: bool, buffer_size: ?usize, allo
     };
 }
 
-/// closes the TCP server socket and stops the listen thread if running
+/// Closes the TCP server socket and stops the listen thread if running.
 ///
 /// It is safe to call this function more than once.
 pub fn close(self: *TcpServer) void {
@@ -216,17 +220,17 @@ pub fn close(self: *TcpServer) void {
     std.log.info("tcp server shut down", .{});
 }
 
-/// starts listening on a dedicated thread for incoming connections and accepts them.
+/// Starts listening for incoming connections on a dedicated thread and accepts them.
 ///
-/// Returns
-/// `NotBound` if the server is not bound
-/// `AlreadyListening` if the listen thread is already running.
-pub fn listen(self: *TcpServer) ListenError!void {
+/// Returns:
+/// - `NotBound` if the server socket is not bound.
+/// - `AlreadyListening` if the listen thread is already running and listening for connections.
+pub fn listen(self: *TcpServer) ServerListenError!void {
     if (!self.bound)
-        return ListenError.NotBound;
+        return ServerListenError.NotBound;
 
     if (self.listen_th != null)
-        return ListenError.AlreadyListening;
+        return ServerListenError.AlreadyListening;
 
     self.listening.store(true, .release);
     errdefer self.listening.store(false, .release);
@@ -245,7 +249,7 @@ fn acceptLoop(self: *TcpServer) void {
     }
 }
 
-fn acceptLoopErrorNet(self: *TcpServer) AcceptLoopError!void {
+fn acceptLoopErrorNet(self: *TcpServer) ServerAcceptLoopError!void {
     var conn = try Connection.accept(self);
     errdefer conn.close();
 

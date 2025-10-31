@@ -8,7 +8,8 @@ const socket_t = posix.socket_t;
 const Ip4Address = net.Ip4Address;
 const Thread = std.Thread;
 const windows = std.os.windows;
-const socket_util = @import("../socket.zig");
+const util = @import("util");
+const socket_util = util.socket;
 const TcpServer = @import("Server.zig");
 const tcp = @import("tcp.zig");
 
@@ -16,9 +17,9 @@ const TcpClient = @This();
 
 const AtomicBool = std.atomic.Value(bool);
 
-pub const ConnectError = tcp.OpenError || posix.ConnectError;
-pub const ListenError = tcp.ListenError || error{NotConnected};
-pub const SendError = tcp.SendError || error{NotConnected};
+pub const ClientConnectError = tcp.OpenError || posix.ConnectError;
+pub const ClientListenError = tcp.ListenError || error{NotConnected};
+pub const ClientSendError = tcp.SendError || error{NotConnected};
 
 socket: socket_t,
 ip4: net.Ip4Address,
@@ -30,8 +31,10 @@ listening: AtomicBool = .init(false),
 listen_th: ?Thread = null,
 buffer_size: usize,
 
-/// Creates a TCP client and connects to the specified IP and port. Uses a blocking or non-blocking socket
-pub fn connect(ip: []const u8, port: u16, blocking: bool, buffer_size: ?usize) ConnectError!TcpClient {
+/// Creates a TCP client and connects to the specified IP and port. Uses a blocking or non-blocking socket.
+///
+/// If passed `buffer_size` is null, the default buffer size defined in `tcp.buffer_size` is used.
+pub fn connect(ip: []const u8, port: u16, blocking: bool, buffer_size: ?usize) ClientConnectError!TcpClient {
     const socket: socket_t = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
     errdefer posix.close(socket);
 
@@ -82,17 +85,17 @@ pub fn close(self: *TcpClient) void {
     std.log.info("tcp client shut down", .{});
 }
 
-/// starts listening on a dedicated thread for incoming data.
+/// Starts listening for incoming data on a dedicated thread.
 ///
-/// Returns
-/// `NotConnected` if the client is not connected
-/// `AlreadyListening` if the listen thread is already running.
-pub fn listen(self: *TcpClient, allocator: std.mem.Allocator) ListenError!void {
+/// Returns:
+/// - `NotConnected` if the client is not connected.
+/// - `AlreadyListening` if the listen thread is already running.
+pub fn listen(self: *TcpClient, allocator: std.mem.Allocator) ClientListenError!void {
     if (!self.connected)
-        return ListenError.NotConnected;
+        return ClientListenError.NotConnected;
 
     if (self.listen_th != null)
-        return ListenError.AlreadyListening;
+        return ClientListenError.AlreadyListening;
 
     self.listening.store(true, .release);
     errdefer self.listening.store(false, .release);
@@ -103,10 +106,8 @@ pub fn listen(self: *TcpClient, allocator: std.mem.Allocator) ListenError!void {
 }
 
 fn listenLoop(self: *const TcpClient, allocator: std.mem.Allocator) std.mem.Allocator.Error!void {
-    if (self.dispatch_fn == null) {
-        std.log.warn("tcp client dispatch function is not set", .{});
-        return;
-    }
+    if (self.dispatch_fn == null)
+        std.log.warn("tcp client dispatch function is not set, incoming data will not be processed", .{});
 
     const buffer = try allocator.alloc(u8, self.buffer_size);
     defer allocator.free(buffer);
@@ -118,22 +119,22 @@ fn listenLoop(self: *const TcpClient, allocator: std.mem.Allocator) std.mem.Allo
         };
         if (data_len == 0) continue;
 
-        self.dispatch_fn.?(self, buffer[0..data_len]) catch continue;
+        if (self.dispatch_fn) |dspch| {
+            dspch(self, buffer[0..data_len]) catch continue;
+        }
     }
 }
 
-/// sends data through client's connected socket
+/// Sends data through the connected socket.
 ///
-/// Returns `NotConnected` if the client is not connected
-pub fn send(self: TcpClient, data: []const u8) SendError!void {
+/// Returns `NotConnected` if the client is not connected.
+/// It might immediately return `WouldBlock` for a blocking operation in non-blocking mode.
+pub fn send(self: TcpClient, data: []const u8) ClientSendError!void {
     if (!self.connected)
-        return SendError.NotConnected;
+        return ClientSendError.NotConnected;
 
-    const bytes_sent = posix.write(self.socket, data) catch |err| switch (err) {
-        posix.WriteError.WouldBlock => if (self.blocking) return err else return,
-        else => return err,
-    };
+    const bytes_sent = try posix.write(self.socket, data);
 
     if (bytes_sent != data.len)
-        std.log.err("tcp client send failed - number of bytes sent: {d} of {d}", .{ bytes_sent, data.len });
+        std.log.err("tcp client send() inconsistency - number of bytes sent: {d} of {d}", .{ bytes_sent, data.len });
 }

@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const socket_t = posix.socket_t;
 const windows = std.os.windows;
-const fcntl = @import("root.zig").fnctl;
+const fcntl = @import("root_priv.zig").fnctl;
 
 pub fn setNonBlocking(socket: socket_t) (posix.FcntlError || posix.SocketError)!void {
     switch (builtin.os.tag) {
